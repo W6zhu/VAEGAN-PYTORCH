@@ -104,3 +104,9 @@ ENV/
 /logs
 /.idea
 /runs
+
+/anatomical_folder
+/fat_fraction_folder
+/errorlog.txt
+/vaegan_env/
+/output_images

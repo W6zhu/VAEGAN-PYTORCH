@@ -1,111 +1,99 @@
-import numpy
+import numpy as np
 import os
+import torch
 from torch.utils.data import Dataset, DataLoader
-import cv2
-from skimage import filters,transform
-numpy.random.seed(5)
+from skimage import transform
+import nibabel as nib  # For loading MRI images
+import matplotlib.pyplot as plt
 
-def _resize(img):
-    rescale_size = 64
-    bbox = (40, 218 - 30, 15, 178 - 15)
-    img = img[bbox[0]:bbox[1], bbox[2]:bbox[3]]
-    # Smooth image before resize to avoid moire patterns
-    scale = img.shape[0] / float(rescale_size)
-    sigma = numpy.sqrt(scale) / 2.0
-    img = filters.gaussian(img, sigma=sigma, multichannel=True)
-    img = transform.resize(img, (rescale_size, rescale_size, 3), order=3,mode="constant")
-    img = (img*255).astype(numpy.uint8)
-    return img
+np.random.seed(5)
 
-class CELEBA(Dataset):
+def load_nii_volume(file_path):
+    """Load and return a 3D NII volume as a tensor, cast to float32."""
+    nii_img = nib.load(file_path)
+    volume = torch.tensor(nii_img.get_fdata(), dtype=torch.float32)  # Convert to a float32 tensor
+    return volume
+
+def slice_nii_volume_to_2d(volume):
+    """Slice a 3D NII volume into a list of 2D slices with debugging info."""
+    slices = []
+    for i in range(volume.shape[2]):  # Assuming shape is (H, W, D)
+        slice_2d = volume[:, :, i]  # Extract 2D slice along the depth dimension
+        
+        # Convert to NumPy array for skimage processing
+        slice_2d_np = slice_2d.numpy()
+        
+        # Skip slices that are empty or have very low variance
+        if slice_2d_np.max() - slice_2d_np.min() < 1e-5:
+            print(f"Skipping slice {i} due to low variance")
+            continue
+        
+        # Resize to 64x64 as expected by the model
+        slice_2d_resized = transform.resize(slice_2d_np, (64, 64), mode="constant")
+        
+        # Convert back to a tensor and add channel dimension
+        slice_2d_tensor = torch.unsqueeze(torch.tensor(slice_2d_resized, dtype=torch.float32), 0)  # (1, H, W)
+        slices.append(slice_2d_tensor)
+    return slices
+
+class MRIPairedDataset(Dataset):
     """
-    loader for the CELEB-A dataset
+    Dataset loader for paired anatomical and fat fraction MRI images,
+    where each 2D slice from the 3D volume is treated as a separate item.
     """
+    def __init__(self, anatomical_folder, fat_fraction_folder):
+        self.anatomical_slices = []
+        self.fat_fraction_slices = []
 
-    def __init__(self, data_folder):
-        #len is the number of files
-        self.len = len(os.listdir(data_folder))
-        #list of file names
-        self.data_names = [os.path.join(data_folder, name) for name in sorted(os.listdir(data_folder))]
-        #data_all
-        #if "train" in data_folder:
-        #    self.data = numpy.load("/home/lapis/Desktop/full_train.npy")
-        #else:
-        #    self.data = numpy.load("/home/lapis/Desktop/full_test.npy")
+        # Load and slice each 3D NIfTI volume
+        anatomical_files = sorted([os.path.join(anatomical_folder, f) for f in os.listdir(anatomical_folder) if f.endswith('.nii')])
+        fat_fraction_files = sorted([os.path.join(fat_fraction_folder, f) for f in os.listdir(fat_fraction_folder) if f.endswith('.nii')])
 
-        self.len = len(self.data_names)
+        # Ensure equal number of paired images in both folders
+        assert len(anatomical_files) == len(fat_fraction_files), "Mismatched number of anatomical and fat fraction files"
+
+        for anat_file, fat_file in zip(anatomical_files, fat_fraction_files):
+            # Load and slice each volume, then extend to the list to flatten slices
+            anatomical_volume = load_nii_volume(anat_file)
+            fat_fraction_volume = load_nii_volume(fat_file)
+
+            anatomical_slices = slice_nii_volume_to_2d(anatomical_volume)
+            fat_fraction_slices = slice_nii_volume_to_2d(fat_fraction_volume)
+
+            # Ensure we only add matching slice counts
+            min_slices = min(len(anatomical_slices), len(fat_fraction_slices))
+            self.anatomical_slices.extend(anatomical_slices[:min_slices])
+            self.fat_fraction_slices.extend(fat_fraction_slices[:min_slices])
+
+        self.len = len(self.anatomical_slices)
+
     def __len__(self):
         return self.len
 
-    def __iter__(self):
-        return self
-
-    def __getitem__(self, item):
-        """
-
-        :param item: image index between 0-(len-1)
-        :return: image
-        """
-        #load image,crop 128x128,resize,transpose(to channel first),scale (so we can use tanh)
-        data = cv2.cvtColor(cv2.imread(self.data_names[item]), cv2.COLOR_BGR2RGB)
-
-        data = _resize(data)
-
-        # CHANNEL FIRST
-        data = data.transpose(2, 0, 1)
-        # TANH
-        data = data.astype("float32") / 127.5 - 1.0
-
-        return (data.copy(),data.copy())
-
-
-class CELEBA_SLURM(Dataset):
-    """
-    loader for the CELEB-A dataset
-    """
-
-    def __init__(self, data_folder):
-        #open the file
-        self.file = open(os.path.join(data_folder,"imgs"),"rb")
-        #get len
-        self.len = int(os.path.getsize(os.path.join(data_folder,"imgs"))/(64*64*3))
-    def __len__(self):
-        return self.len
-
-    def __iter__(self):
-        return self
-
-    def __getitem__(self, item):
-        """
-
-        :param item: image index between 0-(len-1)
-        :return: image
-        """
-        offset = item*3*64*64
-        self.file.seek(offset)
-        data = numpy.fromfile(self.file, dtype=numpy.uint8, count=(3 * 64 * 64))
-        data = numpy.reshape(data, newshape=(3, 64, 64))
-        data = data.astype("float32") / 127.5 - 1.0
-        return (data.copy(),data.copy())
-
+    def __getitem__(self, idx):
+        anatomical_slice = self.anatomical_slices[idx]
+        fat_fraction_slice = self.fat_fraction_slices[idx]
+        return anatomical_slice, fat_fraction_slice
 
 if __name__ == "__main__":
-    dataset = CELEBA_SLURM(".")
-    gen = DataLoader(dataset, batch_size=128, shuffle=False,num_workers=1)
-    #file = open("test",mode="wb+")
-    from matplotlib import pyplot
-    imgs = []
-    for i,(b,l) in enumerate(gen):
-        print("{}:{}".format(i,len(gen)))
-        #b.numpy().astype("uint8").tofile(file)
-    #file.close()
+    dataset = MRIPairedDataset("anatomical_folder_path", "fat_fraction_folder_path")
+    gen = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=1)  # Set batch_size to any preferred value
 
+    for i, (anatomical_slices, fat_fraction_slices) in enumerate(gen):
+        print(f"Batch {i}: anatomical slices shape {anatomical_slices.shape}, fat fraction slices shape {fat_fraction_slices.shape}")
+        
+        # Display the first anatomical and fat fraction slices from the batch
+        anatomical_img = anatomical_slices[0].squeeze().numpy()  # Select first slice and squeeze out singleton dimensions
+        fat_fraction_img = fat_fraction_slices[0].squeeze().numpy()
 
-    #for i in range(1000):
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow((anatomical_img + 1) / 2, cmap="gray")  # Scale to [0, 1] for display
+        plt.title("Anatomical MRI")
 
-        #a = gen.__iter__().next()
-        #scale between (0,1)
-        #a = (a + 1) / 2
-        #for el in a:
-        #    pyplot.imshow(numpy.transpose(el.numpy(), (1, 2, 0)))
-        #    pyplot.show()
+        plt.subplot(1, 2, 2)
+        plt.imshow((fat_fraction_img + 1) / 2, cmap="gray")
+        plt.title("Fat Fraction MRI")
+
+        plt.show()
+        break  # Displaying only the first batch
