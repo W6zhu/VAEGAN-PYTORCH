@@ -85,7 +85,7 @@ class Decoder(nn.Module):
             DecoderBlock(channel_in=256, channel_out=128),
             DecoderBlock(channel_in=128, channel_out=64),
             DecoderBlock(channel_in=64, channel_out=32),
-            nn.Conv2d(in_channels=32, out_channels=128, kernel_size=5, stride=1, padding=2),  # Changed to 128 channels
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=5, stride=1, padding=2),  # Changed to 1 channel for grayscale
             nn.Tanh()
         )
 
@@ -95,20 +95,27 @@ class Decoder(nn.Module):
         ten = self.conv(ten)
         print("Shape after Decoder:", ten.shape)  # This should now print a shape with 128 channels
         return ten
-    
+        
 
 class Discriminator(nn.Module):
-    def __init__(self, channel_in=1, recon_level=3):
+    def __init__(self, channel_in=128, recon_level=3):
         super(Discriminator, self).__init__()
         self.size = channel_in
         self.recon_level = recon_level
+
+        # Adjusted the convolution layers to work with expanded input channels
         self.conv = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(in_channels=channel_in, out_channels=32, kernel_size=5, stride=1, padding=2), nn.ReLU()),
+            nn.Sequential(
+                nn.Conv2d(in_channels=channel_in, out_channels=32, kernel_size=5, stride=1, padding=2),
+                nn.BatchNorm2d(32),
+                nn.ReLU()
+            ),
             EncoderBlock(channel_in=32, channel_out=128),
             EncoderBlock(channel_in=128, channel_out=256),
             EncoderBlock(channel_in=256, channel_out=256)
         ])
         
+        # Fully connected layers for final classification
         self.fc = nn.Sequential(
             nn.Linear(in_features=8 * 8 * 256, out_features=1024, bias=False),
             nn.BatchNorm1d(num_features=1024, momentum=0.9),
@@ -117,20 +124,23 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, ten, ten_original, ten_sampled):
+        # Concatenate along the batch dimension to form a single tensor for processing
         ten = torch.cat((ten, ten_original, ten_sampled), 0)
         
+        # Pass through each layer in the conv block
         for i, lay in enumerate(self.conv):
             if i == self.recon_level:
+                # Capture the layer output at the reconstruction level
                 ten, layer_ten = lay(ten, return_layer=True)
-                layer_ten = layer_ten.view(len(layer_ten), -1)
+                layer_ten = layer_ten.view(len(layer_ten), -1)  # Flatten
             else:
                 ten = lay(ten)
         
+        # Flatten for the fully connected layer
         ten = ten.view(len(ten), -1)
         ten = self.fc(ten)
         return layer_ten, torch.sigmoid(ten)
 
-import torch.nn.functional as F  # Add this import for resizing
 
 class VaeGan(nn.Module):
     def __init__(self, z_size=128, recon_level=3):
@@ -141,8 +151,8 @@ class VaeGan(nn.Module):
         self.discriminator = Discriminator(channel_in=128, recon_level=recon_level)
         self.init_parameters()
 
-        # New layer to match channels of `ten_original` to `ten`
-        self.channel_match = nn.Conv2d(1, 128, kernel_size=1, stride=1, padding=0)
+        # Layer to expand single-channel tensors to 128 channels
+        self.channel_expansion = nn.Conv2d(1, 128, kernel_size=1)
 
     def init_parameters(self):
         for m in self.modules():
@@ -158,24 +168,27 @@ class VaeGan(nn.Module):
             ten_original = anatomical_img
             mus, log_variances = self.encoder(anatomical_img, fat_fraction_img)
             variances = torch.exp(log_variances * 0.5)
+            
+            # Generate encoded tensor and sampled tensor
             ten_from_normal = torch.randn(len(anatomical_img), self.z_size, device=ten_original.device, requires_grad=True)
             ten = ten_from_normal * variances + mus
-            ten = self.decoder(ten)
+            ten = self.decoder(ten)  # This is now single-channel after modification
             
+            # Generate a sampled image for the discriminator
             ten_sampled = torch.randn(len(anatomical_img), self.z_size, device=ten_original.device, requires_grad=True)
             ten_sampled = self.decoder(ten_sampled)
             
-            # Only match channels if `ten_original` has a single channel
-            if ten_original.shape[1] == 1:
-                ten_original = self.channel_match(ten_original)
-            ten_original = F.interpolate(ten_original, size=(ten.shape[2], ten.shape[3]), mode='bilinear', align_corners=False)
-            ten_sampled = F.interpolate(ten_sampled, size=(ten.shape[2], ten.shape[3]), mode='bilinear', align_corners=False)
+            # Resize and expand channels to 128 for the discriminator
+            ten = self.channel_expansion(ten)
+            ten_original = self.channel_expansion(F.interpolate(ten_original, size=(ten.shape[2], ten.shape[3]), mode='bilinear', align_corners=False))
+            ten_sampled = self.channel_expansion(ten_sampled)
 
             # Debug statements to confirm shapes
             print(f"Shape of `ten`: {ten.shape}")
-            print(f"Shape of `ten_original` after resize: {ten_original.shape}")
-            print(f"Shape of `ten_sampled` after resize: {ten_sampled.shape}")
+            print(f"Shape of `ten_original` after resizing and expanding channels: {ten_original.shape}")
+            print(f"Shape of `ten_sampled` after expanding channels: {ten_sampled.shape}")
             
+            # Pass through the discriminator
             ten_layer, ten_class = self.discriminator(ten, ten_original, ten_sampled)
             return ten, ten_class, ten_layer, mus, log_variances
         else:
