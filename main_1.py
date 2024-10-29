@@ -4,7 +4,9 @@ import argparse
 import time
 import os
 from torchvision.utils import save_image
+import torch.nn.functional as F
 
+# print(torch.cuda.is_available())
 # Suppress TensorFlow oneDNN warnings
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
@@ -16,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import RMSprop
 from torch.optim.lr_scheduler import ExponentialLR
 import progressbar
-from generator import MRIPairedDataset
+from generator import MRIPairedDataset, visualize_and_save_sample
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -43,6 +45,11 @@ if __name__ == "__main__":
     lambda_mse = args.lambda_mse
     lr = args.lr
     decay_lr = args.decay_lr
+
+    dataset = MRIPairedDataset(anatomical_folder, fat_fraction_folder)
+
+    # Visualize and save sample images to check data loading
+    visualize_and_save_sample(dataset, save_path="output_images/originaltest.png")
 
     writer = SummaryWriter(comment="_MRI_PAIRED")
     net = VaeGan(z_size=z_size, recon_level=recon_level).cuda()
@@ -126,19 +133,49 @@ if __name__ == "__main__":
         epoch_duration = time.time() - start_time
         print(f"Epoch {i+1}/{n_epochs} completed in {epoch_duration:.2f} seconds with average loss: {epoch_loss_total / len(dataloader):.4f}")
 
-        # Save a single slice for both generated and reconstructed images
+        # Save a single slice for all four images side by side
+        # Save a single slice for all four images side by side
+        import torch.nn.functional as F
+        from torchvision.utils import save_image
+
+        # Function to normalize, convert to grayscale, and resize images to the target size
+        def preprocess_image(image, target_size=(64, 64)):
+            # Normalize to [0, 1] range
+            image = torch.clamp((image - image.min()) / (image.max() - image.min()), 0, 1)
+            # Reduce to single channel by averaging (in case image has more than 1 channel)
+            if image.shape[0] > 1:
+                image = image.mean(dim=0, keepdim=True)
+            # Resize to target size
+            image = F.interpolate(image.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False)
+            return image.squeeze(0)  # Ensure shape [1, H, W] for grayscale
+
+        # Use this inside the epoch loop where you save the output images
         with torch.no_grad():
             net.eval()
-            # Generated image slice
-            synthetic = net(None, 1)  # Generate one synthetic sample
-            save_image(synthetic[0, :, :64, :64], f"output_images/generated_epoch_{i+1}.png")  # Save as PNG
 
-            # Random reconstructed image from test set
+            # Load a batch from the test set
             anatomical_img, fat_fraction_img = next(iter(dataloader_test))
             anatomical_img = anatomical_img.float().cuda()
             fat_fraction_img = fat_fraction_img.float().cuda()
+            
+            # Forward pass for reconstruction
             reconstructed = net(anatomical_img, fat_fraction_img)
-            save_image(reconstructed[0, :, :64, :64], f"output_images/reconstructed_epoch_{i+1}.png")  # Save as PNG
+            
+            # Generate a synthetic image
+            synthetic = net(None, 1)
+            
+            # Take only the first slice of each type, normalize, convert to grayscale, and resize
+            slice_anatomical = preprocess_image(anatomical_img[0])
+            slice_fat_fraction = preprocess_image(fat_fraction_img[0])
+            slice_reconstructed = preprocess_image(reconstructed[0])
+            slice_synthetic = preprocess_image(synthetic[0])
+
+            # Concatenate along the width
+            combined_image = torch.cat((slice_anatomical, slice_fat_fraction, slice_reconstructed, slice_synthetic), dim=2)
+            
+            # Save the combined image
+            save_image(combined_image, f"output_images/epoch_{i+1}_comparison.png")
+
 
         progress.finish()
         
